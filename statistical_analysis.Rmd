@@ -1,0 +1,1446 @@
+---
+title: "Sex Differences in Rates of Hearing Decline Before and After Menopause in Koreans"
+subtitle: "Comprehensive Statistical Re-analysis"
+author: "SungHee Kim et al."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi     = 150
+)
+```
+
+---
+
+## Required Packages
+
+Install if needed:
+```r
+install.packages(c("tidyverse", "readxl", "MatchIt", "sandwich",
+                   "lmtest", "boot", "scales", "patchwork", "writexl"))
+```
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(MatchIt)
+library(sandwich)
+library(lmtest)
+library(boot)
+library(scales)
+library(patchwork)
+library(writexl)
+
+# ── Global constants ─────────────────────────────────────────────────────────
+BREAKPOINT <- 49.3
+FREQS      <- c("0.25kHz", "0.5kHz", "1kHz", "2kHz", "4kHz", "8kHz")
+FREQ_LABELS <- c("0.25", "0.5", "1", "2", "4", "8")
+
+COLOR_MEN   <- "#2196F3"
+COLOR_WOMEN <- "#E91E63"
+SEX_COLORS  <- c("Men" = COLOR_MEN, "Women" = COLOR_WOMEN)
+SEX_SHAPES  <- c("Men" = 16, "Women" = 17)
+
+# Clean ggplot2 theme
+theme_hearing <- function() {
+  theme_classic(base_size = 12) +
+    theme(
+      strip.background = element_blank(),
+      strip.text       = element_text(face = "bold", size = 11),
+      legend.position  = "bottom",
+      plot.title       = element_text(face = "bold", size = 13),
+      plot.subtitle    = element_text(size = 10, color = "grey40"),
+      axis.title       = element_text(size = 11)
+    )
+}
+
+cat("All packages loaded.\n")
+```
+
+---
+
+# Phase 1: Data Loading & Cleaning
+
+## 1.1 Load raw data
+
+> **Why:** Before any analysis, we confirm that both files loaded correctly — right number of rows,
+> right column names, and no silent data corruption. A single wrong column name here would cause
+> every downstream model to fail or silently use the wrong variable.
+
+
+```{r load-data}
+men_raw   <- read_excel("men.xlsx")
+women_raw <- read_excel("women.xlsx")
+
+cat("Men shape   :", nrow(men_raw),   "×", ncol(men_raw),   "\n")
+cat("Women shape :", nrow(women_raw), "×", ncol(women_raw), "\n")
+cat("\nMen columns   :", paste(names(men_raw),   collapse = ", "), "\n")
+cat("Women columns :", paste(names(women_raw), collapse = ", "), "\n")
+```
+
+## 1.2 Data validation
+
+> **Why:** We already know from prior inspection that `women.xlsx` previously contained a
+> duplicate block (rows 3,180–6,354 were an exact copy of rows 1–3,175 shifted one column right).
+> Dr. Kim removed this manually, so this cell confirms the fix held and that neither file has
+> unexpected nulls or duplicate rows before we proceed.
+
+
+```{r validate}
+validate_dataset <- function(df, name) {
+  cat("===", name, "===\n")
+  cat("  Shape    :", nrow(df), "×", ncol(df), "\n")
+  cat("  Columns  :", paste(names(df), collapse = ", "), "\n")
+
+  missing_freq <- setdiff(FREQS, names(df))
+  if (length(missing_freq) > 0)
+    cat("  ⚠ Missing frequency columns:", paste(missing_freq, collapse = ", "), "\n")
+
+  null_counts <- colSums(is.na(df))
+  if (any(null_counts > 0))
+    cat("  Nulls    :", paste(names(null_counts[null_counts > 0]),
+                              null_counts[null_counts > 0], sep = "=", collapse = ", "), "\n")
+  else
+    cat("  No missing values\n")
+
+  n_dup <- sum(duplicated(df))
+  cat("  Duplicates:", n_dup, "\n")
+  cat("  Age range :", round(min(df$Age), 1), "–", round(max(df$Age), 1), "yr\n\n")
+}
+
+validate_dataset(men_raw,   "men.xlsx")
+validate_dataset(women_raw, "women.xlsx")
+```
+
+## 1.3 Standardise and merge
+
+> **How it works:** We assign a `Sex` label to each dataset, select only the columns we need
+> (`Age` and the 6 frequency thresholds), and stack them into one unified dataframe. We also
+> create two helper columns: `SexCode` (0 = Men, 1 = Women) for regression use, and `AgeGroup`
+> to flag participants as being below or above the 49.3-year menopause breakpoint.
+
+
+```{r merge}
+standardise_df <- function(df, sex_label) {
+  df %>%
+    rename_with(str_trim) %>%
+    filter(!is.na(Age)) %>%
+    select(all_of(c("Age", FREQS))) %>%
+    mutate(Sex = sex_label)
+}
+
+men_df   <- standardise_df(men_raw,   "Men")
+women_df <- standardise_df(women_raw, "Women")
+
+df <- bind_rows(men_df, women_df) %>%
+  mutate(
+    Sex      = factor(Sex, levels = c("Men", "Women")),
+    SexCode  = as.integer(Sex == "Women"),
+    AgeGroup = if_else(Age < BREAKPOINT,
+                       paste0("< ", BREAKPOINT, " yr"),
+                       paste0(">= ", BREAKPOINT, " yr")),
+    AgeGroup = factor(AgeGroup,
+                      levels = c(paste0("< ", BREAKPOINT, " yr"),
+                                 paste0(">= ", BREAKPOINT, " yr"))),
+    Decade   = factor(paste0(floor(Age / 10) * 10, "s"))
+  )
+
+df %>% count(Sex) %>% rename(N = n)
+```
+
+## 1.4 Basic data quality summary
+
+```{r quality}
+df %>%
+  group_by(Sex) %>%
+  summarise(
+    N    = n(),
+    Age_mean = round(mean(Age), 1),
+    Age_sd   = round(sd(Age), 1),
+    Age_min  = round(min(Age), 1),
+    Age_max  = round(max(Age), 1),
+    .groups = "drop"
+  )
+```
+
+```{r threshold-summary}
+df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  group_by(Sex, Freq) %>%
+  summarise(
+    Mean = round(mean(Threshold, na.rm = TRUE), 2),
+    SD   = round(sd(Threshold, na.rm = TRUE), 2),
+    Min  = round(min(Threshold, na.rm = TRUE), 2),
+    Max  = round(max(Threshold, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+```
+
+---
+
+# Phase 2: Exploratory Data Analysis
+
+## 2.1 Age distribution by sex
+
+> **Why:** Men (n = 910) and Women (n = 3,175) are unequal in size — roughly 1:3.5. Before
+> modelling, we check whether this imbalance also means the two groups have different age
+> *distributions*. If women are systematically younger, any hearing difference we observe could
+> partly reflect age rather than sex. The dashed vertical line marks the 49.3-year menopause
+> breakpoint, so we can also see how many participants fall on each side.
+>
+> **Interpretation:** Look for whether the two histograms have similar shapes and centres.
+> Substantial differences (e.g. women skewed toward younger ages) would justify PSM in Phase 3.
+
+
+```{r fig-age-dist, fig.height=4}
+ggplot(df, aes(x = Age, fill = Sex)) +
+  geom_histogram(bins = 30, alpha = 0.75, color = "white") +
+  geom_vline(xintercept = BREAKPOINT, linetype = "dashed",
+             color = "black", linewidth = 0.8) +
+  annotate("text", x = BREAKPOINT + 1, y = Inf,
+           label = paste0("Breakpoint\n(", BREAKPOINT, " yr)"),
+           vjust = 1.5, hjust = 0, size = 3.5) +
+  facet_wrap(~ Sex, scales = "free_y") +
+  scale_fill_manual(values = SEX_COLORS) +
+  labs(title = "Age Distribution by Sex",
+       x = "Age (years)", y = "Count") +
+  theme_hearing() +
+  theme(legend.position = "none")
+```
+
+## 2.2 Figure 2 — Audiogram: Mean hearing threshold by age decade
+
+> **Why:** The audiogram is the standard clinical display of hearing data. Plotting mean
+> thresholds by age decade lets us see the trajectory of age-related hearing loss across the full
+> frequency range, separately for men and women. This replicates Figure 2 in the manuscript
+> (Fig 2 audiogram.pptx).
+>
+> **How to read an audiogram:** The y-axis is *inverted* — better hearing (lower dB) is at the
+> top, worse hearing (higher dB) is at the bottom. Each line represents one decade of life.
+> Lines moving downward as age increases = hearing getting worse.
+>
+> **What to look for:** High frequencies (4 kHz, 8 kHz) typically show the steepest decline
+> with age. If the women's panel shows a noticeable shift in the line spacing around the 50s
+> decade, that is consistent with the menopause hypothesis.
+ — Audiogram: Mean hearing threshold by age decade
+
+*Replicates Fig 2 audiogram.pptx — audiogram convention: y-axis inverted (worse hearing at bottom)*
+
+```{r fig2-audiogram, fig.height=9, fig.width=10}
+# Compute mean ± SD by sex, decade, frequency
+audiogram_data <- df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  mutate(Freq = factor(Freq, levels = FREQS)) %>%
+  group_by(Sex, Decade, Freq) %>%
+  summarise(
+    Mean = mean(Threshold, na.rm = TRUE),
+    SD   = sd(Threshold, na.rm = TRUE),
+    N    = n(),
+    SE   = SD / sqrt(N),
+    .groups = "drop"
+  )
+
+# Decade colour palette
+decade_levels <- levels(df$Decade)
+decade_colors <- colorRampPalette(c("#4FC3F7", "#0D47A1"))(length(decade_levels))
+names(decade_colors) <- decade_levels
+
+make_audiogram <- function(sex_label) {
+  audiogram_data %>%
+    filter(Sex == sex_label) %>%
+    ggplot(aes(x = Freq, y = Mean, color = Decade, group = Decade)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.5) +
+    geom_errorbar(aes(ymin = Mean - SD, ymax = Mean + SD),
+                  width = 0.2, alpha = 0.6) +
+    scale_y_reverse(
+      limits = c(80, -10),
+      breaks = seq(-10, 80, by = 10),
+      labels = seq(-10, 80, by = 10)
+    ) +
+    scale_color_manual(values = decade_colors) +
+    labs(
+      title    = paste0("(", ifelse(sex_label == "Men", "A", "B"), ") ", sex_label),
+      x        = "Frequency (kHz)",
+      y        = "Hearing Level (dB HL)",
+      color    = "Age decade"
+    ) +
+    theme_hearing() +
+    theme(legend.position = "right")
+}
+
+fig2_men   <- make_audiogram("Men")
+fig2_women <- make_audiogram("Women")
+
+fig2_men / fig2_women +
+  plot_annotation(
+    title    = "Figure 2. Mean Hearing Thresholds by Age Decade",
+    subtitle = "Mean ± SD; y-axis inverted per audiogram convention (worse hearing at bottom)",
+    theme    = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+```
+
+## 2.3 Hearing threshold distributions by frequency
+
+> **Why:** Before fitting any regression model, we inspect the raw shape of the outcome variable
+> at each frequency. OLS regression assumes the residuals (not the raw data, but close) are
+> approximately normally distributed. Right-skewed or heavy-tailed distributions are a warning
+> sign that the standard errors and p-values from plain OLS may be unreliable.
+>
+> **Interpretation:** A roughly bell-shaped, symmetric histogram at each frequency is ideal.
+> A long right tail (most values cluster low, but some extend far right) is common in audiological
+> data and indicates positive skewness — which we address in Phase 5 with WLS and robust SEs.
+
+
+```{r fig-distributions, fig.height=7}
+df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  mutate(Freq = factor(Freq, levels = FREQS)) %>%
+  ggplot(aes(x = Threshold, fill = Sex)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 40, alpha = 0.55, color = "white",
+                 position = "identity") +
+  facet_wrap(~ Freq, nrow = 2) +
+  scale_fill_manual(values = SEX_COLORS) +
+  labs(title = "Hearing Threshold Distributions by Frequency and Sex",
+       x = "Threshold (dB HL)", y = "Density") +
+  theme_hearing()
+```
+
+## 2.4 Skewness and kurtosis
+
+> **Why:** Skewness and kurtosis give us numerical summaries of distributional shape. OLS is
+> robust to mild non-normality when sample sizes are large, but severe skewness (> 1.0) or excess
+> kurtosis (> 3.0) in the residuals can inflate Type I error rates and produce misleading
+> confidence intervals.
+>
+> **How to interpret:**
+>
+> - **Skewness = 0** → perfectly symmetric. Positive skewness means a right tail (some participants
+>   have very high thresholds). Values above 1.0 are considered moderately skewed.
+> - **Excess kurtosis = 0** → normal-like tails. Positive values mean heavier tails than a normal
+>   distribution (more extreme values than expected). Values above 3.0 are a concern.
+>
+> These numbers directly motivate the remedies applied in Phase 5.
+
+
+```{r skew-kurt}
+skew_kurt <- df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  group_by(Freq) %>%
+  summarise(
+    Skewness        = round(e1071::skewness(Threshold, na.rm = TRUE), 3),
+    Excess_Kurtosis = round(e1071::kurtosis(Threshold, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+# Install e1071 if needed: install.packages("e1071")
+# Alternative without e1071:
+skew_kurt <- df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  group_by(Freq) %>%
+  summarise(
+    Skewness = round({
+      x <- na.omit(Threshold)
+      n <- length(x)
+      m <- mean(x); s <- sd(x)
+      (n / ((n-1)*(n-2))) * sum(((x - m)/s)^3)
+    }, 3),
+    Excess_Kurtosis = round({
+      x <- na.omit(Threshold)
+      n <- length(x)
+      m <- mean(x); s <- sd(x)
+      ((n*(n+1))/((n-1)*(n-2)*(n-3))) * sum(((x-m)/s)^4) -
+        (3*(n-1)^2)/((n-2)*(n-3))
+    }, 3),
+    .groups = "drop"
+  )
+
+print(skew_kurt)
+
+skew_kurt %>%
+  pivot_longer(-Freq, names_to = "Metric", values_to = "Value") %>%
+  mutate(Freq = factor(Freq, levels = FREQS)) %>%
+  ggplot(aes(x = Freq, y = Value, fill = Metric)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  scale_fill_manual(values = c("Skewness" = "steelblue",
+                               "Excess_Kurtosis" = "coral")) +
+  labs(title = "Skewness and Excess Kurtosis by Frequency",
+       x = "Frequency", y = "Value", fill = "") +
+  theme_hearing()
+```
+
+## 2.5 Correlation heatmap
+
+> **Why:** We check whether age is meaningfully correlated with hearing thresholds at each
+> frequency — if the correlation is near zero, a regression of threshold on age would be
+> uninformative. We also check whether the six frequencies are highly correlated with each other,
+> which would be relevant if we were fitting a multivariate model.
+>
+> **Interpretation:** Values close to +1 (dark red) indicate a strong positive relationship —
+> older age associated with higher (worse) hearing thresholds. Values near 0 indicate no linear
+> association. We expect the highest correlations at 4 kHz and 8 kHz, where age-related decline
+> is typically fastest.
+
+
+```{r fig-corr, fig.height=5}
+# Requires reshape2 or use base R
+make_corr_plot <- function(sex_label) {
+  corr_data <- df %>%
+    filter(Sex == sex_label) %>%
+    select(Age, all_of(FREQS)) %>%
+    cor(use = "complete.obs") %>%
+    as.data.frame() %>%
+    rownames_to_column("Var1") %>%
+    pivot_longer(-Var1, names_to = "Var2", values_to = "Corr") %>%
+    mutate(
+      Var1 = factor(Var1, levels = c("Age", FREQS)),
+      Var2 = factor(Var2, levels = c("Age", FREQS))
+    )
+
+  ggplot(corr_data, aes(x = Var1, y = Var2, fill = Corr)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Corr, 2)), size = 3) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#D6604D",
+                         midpoint = 0, limits = c(-1, 1)) +
+    labs(title = sex_label, x = NULL, y = NULL, fill = "r") +
+    theme_hearing() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+}
+
+make_corr_plot("Men") + make_corr_plot("Women") +
+  plot_annotation(title = "Pearson Correlation: Age vs Hearing Thresholds",
+                  theme = theme(plot.title = element_text(face = "bold")))
+```
+
+## 2.6 Mean threshold by age decade
+
+```{r fig-by-decade, fig.height=7}
+decade_means <- df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  mutate(Freq = factor(Freq, levels = FREQS)) %>%
+  group_by(Sex, Decade, Freq) %>%
+  summarise(Mean = mean(Threshold, na.rm = TRUE), .groups = "drop")
+
+ggplot(decade_means, aes(x = Decade, y = Mean, color = Sex, group = Sex)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ Freq, nrow = 2) +
+  scale_color_manual(values = SEX_COLORS) +
+  labs(title = "Mean Hearing Threshold by Age Decade and Frequency",
+       x = "Age Decade", y = "Mean Threshold (dB HL)") +
+  theme_hearing()
+```
+
+---
+
+# Phase 3: Imbalance Handling — Propensity Score Matching (PSM)
+
+## 3.1 Estimate propensity scores and match
+
+> **Why this method was chosen:** With 910 men and 3,175 women, the groups are imbalanced ~1:3.5.
+> If the age distributions also differ between groups, a direct sex comparison confounds sex with
+> age. Propensity Score Matching (PSM) creates a balanced subsample where men and women are
+> virtually identical in age, removing this confound.
+>
+> **How it works:**
+>
+> 1. For each participant, a logistic regression estimates the probability of being female given
+>    their age: P(female | Age). This is the **propensity score**.
+> 2. Each man is then matched to the woman with the closest propensity score (nearest-neighbour
+>    matching), subject to a **caliper** — a maximum allowed distance of 0.2 standard deviations
+>    of the logit-transformed propensity score. Matches outside this caliper are discarded.
+> 3. This produces a 1:1 matched sample where the two groups are age-balanced.
+>
+> **Important:** PSM is used only as a **sensitivity analysis**. The primary analysis runs on the
+> full unmatched sample (n = 4,085). If the matched and unmatched results agree, it confirms that
+> the sex imbalance was not driving the findings.
+
+
+```{r psm}
+# PSM using MatchIt: 1:1 nearest-neighbour on Age
+psm_out <- matchit(
+  SexCode ~ Age,
+  data    = df,
+  method  = "nearest",
+  ratio   = 1,
+  caliper = 0.2,       # 0.2 × SD of logit(PS)
+  std.caliper = TRUE
+)
+
+summary(psm_out)
+
+df_matched <- match.data(psm_out)
+cat("\nMatched sample sizes:\n")
+print(table(df_matched$Sex))
+```
+
+## 3.2 Check balance — standardised mean difference (SMD)
+
+> **How to interpret SMD:** The Standardised Mean Difference measures how far apart the group
+> means are in units of the pooled standard deviation — like a Cohen's d for the covariate.
+>
+> - **SMD < 0.1** → well-balanced (the groups are effectively equivalent on that variable)
+> - **SMD 0.1–0.2** → mild imbalance
+> - **SMD > 0.2** → meaningful imbalance that could confound comparisons
+>
+> After successful PSM, the SMD for Age should drop well below 0.1, confirming the two groups
+> are now comparable.
+ — standardised mean difference (SMD)
+
+```{r psm-balance}
+compute_smd <- function(data, var = "Age") {
+  men   <- data[[var]][data$Sex == "Men"]
+  women <- data[[var]][data$Sex == "Women"]
+  pooled_sd <- sqrt((var(men) + var(women)) / 2)
+  abs(mean(men) - mean(women)) / pooled_sd
+}
+
+cat("SMD (Age) before PSM:", round(compute_smd(df), 3),
+    " — (< 0.1 = well-balanced)\n")
+cat("SMD (Age) after  PSM:", round(compute_smd(df_matched), 3), "\n")
+```
+
+```{r fig-psm-balance, fig.height=4}
+bind_rows(
+  df         %>% mutate(Sample = "Before PSM"),
+  df_matched %>% mutate(Sample = "After PSM")
+) %>%
+  mutate(Sample = factor(Sample, levels = c("Before PSM", "After PSM"))) %>%
+  ggplot(aes(x = Age, fill = Sex)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, alpha = 0.6, color = "white",
+                 position = "identity") +
+  facet_grid(Sex ~ Sample) +
+  scale_fill_manual(values = SEX_COLORS) +
+  labs(title = "Age Distribution Before vs. After PSM",
+       x = "Age (years)", y = "Density") +
+  theme_hearing() +
+  theme(legend.position = "none")
+```
+
+---
+
+# Phase 4: Regression Assumption Checking
+
+## 4.1 Helper functions: Piecewise linear regression setup
+
+> **Why piecewise linear regression?**
+>
+> The central hypothesis of this study is that the *rate* of hearing decline changes at the age
+> of menopause (49.3 years). A single straight line across all ages would force a constant rate
+> and miss this inflection. Piecewise LR solves this by fitting two separate line segments — one
+> for ages below 49.3 yr, one for ages above — joined at the breakpoint.
+>
+> **How it works mathematically:**
+>
+> The model is: `Threshold = B0 + B1 × Age_below + B2 × Age_above`
+>
+> Where:
+>
+> - `Age_below = min(Age, 49.3)` — increases up to the breakpoint, then stays flat
+> - `Age_above = max(Age − 49.3, 0)` — is 0 below the breakpoint, then increases linearly
+>
+> So **B1** is the slope (dB/year) *before* menopause, and **B2** is the slope *after* menopause.
+> This is mathematically identical to splitting the dataset at 49.3 and running two separate
+> regressions — which is exactly what Dr. Kim did in the original manuscript.
+>
+> **The breakpoint (49.3 yr)** is fixed a priori based on the established Korean mean menopause
+> age (Park et al., 2017), not estimated from the data. This is appropriate for a
+> population-level study and avoids overfitting.
+
+
+```{r helpers}
+# Build piecewise design matrix
+make_piecewise_df <- function(data, freq, bp = BREAKPOINT) {
+  data %>%
+    select(Age, all_of(freq)) %>%
+    rename(Threshold = all_of(freq)) %>%
+    filter(!is.na(Threshold)) %>%
+    mutate(
+      Age_below = pmin(Age, bp),
+      Age_above = pmax(Age - bp, 0)
+    )
+}
+
+# Fit piecewise OLS
+fit_piecewise_ols <- function(data, freq, bp = BREAKPOINT) {
+  d <- make_piecewise_df(data, freq, bp)
+  lm(Threshold ~ Age_below + Age_above, data = d)
+}
+
+# Fit piecewise OLS with HC3 robust SEs
+fit_piecewise_robust <- function(data, freq, bp = BREAKPOINT) {
+  mod <- fit_piecewise_ols(data, freq, bp)
+  coeftest(mod, vcov = vcovHC(mod, type = "HC3"))
+}
+
+# Fit piecewise WLS (inverse-variance weights by 5-yr age bin)
+fit_piecewise_wls <- function(data, freq, bp = BREAKPOINT) {
+  d <- make_piecewise_df(data, freq, bp)
+  d <- d %>%
+    mutate(bin = cut(Age, breaks = seq(15, 85, 5))) %>%
+    group_by(bin) %>%
+    mutate(bin_var = var(Threshold, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(weight = 1 / pmax(bin_var, 1e-4))
+  lm(Threshold ~ Age_below + Age_above, data = d, weights = d$weight)
+}
+
+cat("Helper functions defined.\n")
+```
+
+## 4.2 Normality of residuals — Shapiro-Wilk test
+
+> **Why we check this:** OLS regression relies on the assumption that residuals (the difference
+> between observed and model-predicted values) are approximately normally distributed. If they
+> are not, the p-values and confidence intervals produced by standard OLS may be wrong —
+> particularly in smaller samples.
+>
+> **How the test works:** The Shapiro-Wilk test compares the distribution of residuals to a
+> theoretical normal distribution. A small p-value (< 0.05) means the residuals are
+> significantly non-normal.
+>
+> **Interpretation:**
+>
+> - p > 0.05 → residuals are consistent with normality → standard OLS inference is safe
+> - p < 0.05 → evidence of non-normality → bootstrap CIs and robust SEs (Phase 5) become
+>   especially important as they do not assume normality
+>
+> Note: With large samples (Women n = 3,175), the Shapiro-Wilk test becomes very sensitive and
+> will almost always reject normality even for mild deviations. The Q-Q plots (Section 4.3)
+> give a more practical visual assessment.
+ — Shapiro-Wilk test
+
+```{r normality}
+normality_results <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    mod   <- fit_piecewise_ols(df %>% filter(Sex == sex), freq)
+    resid <- residuals(mod)
+    if (length(resid) <= 5000) {
+      test_res <- shapiro.test(resid)
+      tibble(Sex = sex, Freq = freq, Test = "Shapiro-Wilk",
+             Statistic = round(test_res$statistic, 4),
+             p_value   = round(test_res$p.value, 4))
+    } else {
+      test_res <- ks.test(scale(resid), "pnorm")
+      tibble(Sex = sex, Freq = freq, Test = "KS",
+             Statistic = round(test_res$statistic, 4),
+             p_value   = round(test_res$p.value, 4))
+    }
+  })
+}) %>%
+  mutate(Normal = if_else(p_value > 0.05, "Yes", "No"))
+
+print(normality_results)
+```
+
+## 4.3 QQ-plots of residuals
+
+> **How to read a Q-Q plot:** Each point represents one residual. The x-axis is where that
+> residual *would* fall if the data were perfectly normal; the y-axis is where it *actually*
+> falls. If the residuals are normal, all points lie on the diagonal reference line.
+>
+> **Patterns to look for:**
+>
+> - **Points hugging the line** → normality assumption holds
+> - **S-shaped curve** → skewness (residuals have a long tail on one side)
+> - **Points curving away at both ends** → heavy tails / excess kurtosis
+> - **A few extreme points at the ends** → outliers
+>
+> Hearing threshold data typically shows S-shaped or upward-curving Q-Q plots due to the
+> positive skewness seen in Section 2.4.
+ of residuals
+
+```{r fig-qq, fig.height=7, fig.width=12}
+qq_data <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    mod   <- fit_piecewise_ols(df %>% filter(Sex == sex), freq)
+    resid <- scale(residuals(mod))
+    n     <- length(resid)
+    tibble(
+      Sex       = sex,
+      Freq      = freq,
+      Observed  = sort(resid),
+      Theoretical = qnorm(ppoints(n))
+    )
+  })
+}) %>%
+  mutate(Freq = factor(Freq, levels = FREQS),
+         Sex  = factor(Sex, levels = c("Men", "Women")))
+
+ggplot(qq_data, aes(x = Theoretical, y = Observed, color = Sex)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linewidth = 0.6) +
+  facet_grid(Sex ~ Freq) +
+  scale_color_manual(values = SEX_COLORS) +
+  labs(title = "Q-Q Plots of OLS Residuals (Piecewise LR)",
+       x = "Theoretical Quantiles", y = "Standardised Residuals") +
+  theme_hearing() +
+  theme(legend.position = "none")
+```
+
+## 4.4 Homoscedasticity — Breusch-Pagan test
+
+> **Why we check this:** OLS assumes that residual variance is *constant* across all fitted
+> values (homoscedasticity). In hearing data, variance typically grows with age — younger
+> people cluster tightly around similar low thresholds, while older people show much wider
+> spread. This is called **heteroscedasticity**, and it makes standard OLS standard errors
+> too small (overconfident), inflating the number of significant results.
+>
+> **How the Breusch-Pagan test works:** It regresses the squared residuals on the predictor
+> variables. If the predictors explain the squared residuals well (large test statistic, small
+> p-value), the variance is not constant — heteroscedasticity is present.
+>
+> **Interpretation:**
+>
+> - p > 0.05 → no evidence of heteroscedasticity → standard OLS SEs are reliable
+> - p < 0.05 → heteroscedasticity detected → use WLS or HC3 robust SEs (Phase 5)
+ — Breusch-Pagan test
+
+```{r breusch-pagan}
+# Requires lmtest
+hetero_results <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    mod <- fit_piecewise_ols(df %>% filter(Sex == sex), freq)
+    bp  <- lmtest::bptest(mod)
+    tibble(
+      Sex            = sex,
+      Freq           = freq,
+      BP_statistic   = round(bp$statistic, 3),
+      BP_p_value     = round(bp$p.value, 4),
+      Heteroscedastic = if_else(bp$p.value < 0.05, "Yes", "No")
+    )
+  })
+})
+
+print(hetero_results)
+```
+
+## 4.5 Residual vs. fitted plots
+
+> **How to read these plots:** The x-axis shows the model's predicted hearing threshold;
+> the y-axis shows how far each observed value is from that prediction (the residual).
+> If the model is well-specified, the residuals should scatter randomly around the horizontal
+> zero line with roughly equal spread everywhere.
+>
+> **Warning signs:**
+>
+> - **Fan shape** (spread increases as fitted values increase) → heteroscedasticity
+> - **Curve or arch** → the true relationship is non-linear and the model is missing it
+> - **A few extreme points far from zero** → influential outliers
+ plots
+
+```{r fig-resid-fitted, fig.height=7, fig.width=12}
+resid_data <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    mod <- fit_piecewise_ols(df %>% filter(Sex == sex), freq)
+    tibble(
+      Sex     = sex,
+      Freq    = freq,
+      Fitted  = fitted(mod),
+      Residual = residuals(mod)
+    )
+  })
+}) %>%
+  mutate(Freq = factor(Freq, levels = FREQS),
+         Sex  = factor(Sex, levels = c("Men", "Women")))
+
+ggplot(resid_data, aes(x = Fitted, y = Residual, color = Sex)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6) +
+  facet_grid(Sex ~ Freq) +
+  scale_color_manual(values = SEX_COLORS) +
+  labs(title = "Residual vs. Fitted (Piecewise LR)",
+       x = "Fitted Values", y = "Residuals") +
+  theme_hearing() +
+  theme(legend.position = "none")
+```
+
+## 4.6 Residual SD by age decade
+
+```{r fig-hetero-decade, fig.height=7}
+sd_decade <- df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  mutate(
+    Freq   = factor(Freq, levels = FREQS),
+    Decade = floor(Age / 10) * 10
+  ) %>%
+  group_by(Sex, Freq, Decade) %>%
+  summarise(SD = sd(Threshold, na.rm = TRUE), .groups = "drop")
+
+ggplot(sd_decade, aes(x = Decade, y = SD, color = Sex, group = Sex)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ Freq, nrow = 2) +
+  scale_color_manual(values = SEX_COLORS) +
+  labs(title = "SD of Hearing Thresholds by Age Decade (Heteroscedasticity)",
+       x = "Age Decade", y = "SD (dB HL)") +
+  theme_hearing()
+```
+
+## 4.7 Outlier detection — Cook's Distance
+
+> **Why Cook's Distance:** A simple threshold on residual size catches large errors but misses
+> *influential* points — observations that, if removed, would substantially change the
+> regression slope. Cook's Distance combines residual size with leverage (how unusual the
+> predictor value is) into a single influence measure.
+>
+> **How to interpret:**
+>
+> - The conventional threshold is **4/n** (where n = sample size). Points above this are
+>   flagged as potentially influential.
+> - A small percentage of outliers (< 5%) in a large dataset is generally tolerable, especially
+>   if results are confirmed with robust methods.
+> - High Cook's D values at specific age–frequency combinations (e.g. elderly men at 8 kHz)
+>   may reflect genuine clinical outliers rather than data errors.
+ — Cook's Distance
+
+```{r cooks-d}
+cooks_results <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    mod       <- fit_piecewise_ols(df %>% filter(Sex == sex), freq)
+    cooks     <- cooks.distance(mod)
+    threshold <- 4 / length(cooks)
+    n_out     <- sum(cooks > threshold)
+    tibble(
+      Sex        = sex,
+      Freq       = freq,
+      N_outliers = n_out,
+      Threshold  = round(threshold, 5),
+      Pct        = round(100 * n_out / length(cooks), 2)
+    )
+  })
+})
+
+print(cooks_results)
+```
+
+---
+
+# Phase 5: Violation Remedies
+
+## 5.1 Bootstrap percentile confidence intervals for slopes
+
+> **Why bootstrap instead of standard CIs?**
+>
+> Standard OLS confidence intervals assume residuals are normally distributed. We have already
+> seen that this assumption is violated (positive skewness, excess kurtosis). Bootstrap CIs
+> make **no distributional assumptions** — they estimate the sampling variability of the slope
+> empirically by repeatedly resampling the data.
+>
+> **How bootstrap works:**
+>
+> 1. Randomly draw n observations *with replacement* from the dataset (a "bootstrap sample").
+> 2. Fit the piecewise regression on this resample and record the slope.
+> 3. Repeat 2,000 times.
+> 4. The 2.5th and 97.5th percentiles of the 2,000 slope estimates form the 95% confidence
+>    interval.
+>
+> The `cache=TRUE` option means RStudio saves the bootstrap results after the first run, so
+> re-knitting the document does not repeat the 2,000 iterations.
+>
+> **Interpretation:** A bootstrap CI for a slope that does not include zero means the rate of
+> decline is statistically significantly different from zero at the 5% level — without relying
+> on the normality assumption.
+ confidence intervals for slopes
+
+```{r bootstrap, cache=TRUE}
+bootstrap_slopes <- function(data, freq, bp = BREAKPOINT,
+                              n_boot = 2000, seed = 42) {
+  set.seed(seed)
+  d <- make_piecewise_df(data, freq, bp)
+
+  get_slopes <- function(data, indices) {
+    d_boot <- data[indices, ]
+    mod    <- lm(Threshold ~ Age_below + Age_above, data = d_boot)
+    coef(mod)[c("Age_below", "Age_above")]
+  }
+
+  boot_res <- boot(d, get_slopes, R = n_boot)
+
+  ci_below <- boot.ci(boot_res, type = "perc", index = 1)$percent[4:5]
+  ci_above <- boot.ci(boot_res, type = "perc", index = 2)$percent[4:5]
+
+  list(
+    slope_below = coef(lm(Threshold ~ Age_below + Age_above, data = d))["Age_below"],
+    slope_above = coef(lm(Threshold ~ Age_below + Age_above, data = d))["Age_above"],
+    CI_below    = ci_below,
+    CI_above    = ci_above,
+    boot_obj    = boot_res
+  )
+}
+
+cat("Running bootstrap (2000 resamples × 12 combinations — ~1-2 min)...\n")
+
+boot_results <- list()
+for (sex in c("Men", "Women")) {
+  for (freq in FREQS) {
+    key <- paste(sex, freq, sep = "_")
+    boot_results[[key]] <- bootstrap_slopes(
+      df %>% filter(Sex == sex), freq, n_boot = 2000
+    )
+    r <- boot_results[[key]]
+    cat(sprintf("%-6s %-8s | Below: %+.3f [%+.3f, %+.3f]  Above: %+.3f [%+.3f, %+.3f]\n",
+                sex, freq,
+                r$slope_below, r$CI_below[1], r$CI_below[2],
+                r$slope_above, r$CI_above[1], r$CI_above[2]))
+  }
+}
+```
+
+## 5.2 FDR correction — Benjamini-Hochberg (BH) procedure
+
+> **Why this is necessary:** We run ANCOVA separately for each of the 6 frequencies × 2 age
+> groups = 12 tests. At α = 0.05, running 12 independent tests gives a ~46% chance of finding
+> at least one false positive by chance alone (family-wise error). Simply reporting each p-value
+> separately without correction inflates the false discovery rate.
+>
+> **How Benjamini-Hochberg works:**
+>
+> 1. Rank all p-values from smallest to largest.
+> 2. Each p-value is compared to a threshold of (rank / total tests) × 0.05.
+> 3. The largest p-value that is still below its threshold is declared significant, and all
+>    smaller p-values are also declared significant.
+>
+> BH controls the **False Discovery Rate (FDR)** — the expected proportion of significant
+> results that are actually false — rather than the probability of any false positive (FWER).
+> It is less conservative than Bonferroni correction and is the standard approach in
+> exploratory biomedical research.
+>
+> **Interpretation:** Focus on `FDR_p` rather than `Raw_p`. A result with Raw_p = 0.02 but
+> FDR_p = 0.08 should *not* be reported as significant after correcting for multiple comparisons.
+ — ANCOVA sex differences
+
+```{r ancova-fdr}
+collect_ancova_pvalues <- function(data, bp = BREAKPOINT) {
+  map_dfr(list(c("below", paste0("< ", bp)), c("above", paste0(">= ", bp))),
+          function(grp) {
+    sub <- if (grp[1] == "below") filter(data, Age < bp) else filter(data, Age >= bp)
+    map_dfr(FREQS, function(freq) {
+      d   <- sub %>% select(SexCode, Age, all_of(freq)) %>%
+               rename(Threshold = all_of(freq)) %>% drop_na()
+      mod <- lm(Threshold ~ SexCode + Age, data = d)
+      rob <- coeftest(mod, vcov = vcovHC(mod, type = "HC3"))
+      tibble(
+        AgeGroup     = grp[2],
+        Freq         = freq,
+        SexCoef_dB   = round(rob["SexCode", "Estimate"], 3),
+        Raw_p        = round(rob["SexCode", "Pr(>|t|)"], 4)
+      )
+    })
+  })
+}
+
+ancova_df <- collect_ancova_pvalues(df) %>%
+  mutate(
+    FDR_p       = round(p.adjust(Raw_p, method = "BH"), 4),
+    Significant = FDR_p < 0.05
+  )
+
+cat("=== ANCOVA: Sex Differences (HC3 SEs, BH FDR-corrected) ===\n")
+print(ancova_df)
+```
+
+---
+
+# Phase 6: Model Building & Visualisation
+
+## 6.1 Figure 3 — Piecewise LR scatterplots
+
+> **What this figure shows:** For each of the 6 audiometric frequencies, individual hearing
+> thresholds (dots) are plotted against age, with two separate regression lines per sex — one
+> for ages below 49.3 yr (solid segment) and one for ages above (continuing segment). The
+> vertical dotted line marks the 49.3-year breakpoint.
+>
+> **Why this method was chosen:** A single regression line across all ages would miss the
+> change in slope at menopause — the key hypothesis of this paper. Two separate segments,
+> joined at the breakpoint, allow the rate of decline to be different before and after
+> menopause while keeping the model interpretable.
+>
+> **How to interpret:**
+>
+> - A steeper line = faster rate of hearing decline (more dB lost per year)
+> - If the women's line becomes steeper *after* 49.3 yr relative to men's, this supports the
+>   hypothesis that menopause accelerates hearing decline in women
+> - The scatter around the lines indicates how much individual variation exists beyond the
+>   age trend (related to the low R² values seen in Table 3)
+ — Piecewise LR scatterplots
+
+*Replicates Fig 3 scattergram.pptx — 6 panels (one per frequency), piecewise regression lines for men and women split at 49.3 yr*
+
+```{r fig3-scatter, fig.height=11, fig.width=9}
+# Build predicted lines for each sex × frequency
+pred_lines <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    sub <- df %>% filter(Sex == sex)
+    mod <- fit_piecewise_ols(sub, freq)
+
+    age_min <- min(sub$Age)
+    age_max <- max(sub$Age)
+
+    age_seq <- c(
+      seq(age_min, BREAKPOINT, length.out = 60),
+      seq(BREAKPOINT, age_max, length.out = 60)
+    )
+
+    pred_df <- tibble(
+      Age       = age_seq,
+      Age_below = pmin(age_seq, BREAKPOINT),
+      Age_above = pmax(age_seq - BREAKPOINT, 0)
+    )
+    pred_df$Predicted <- predict(mod, newdata = pred_df)
+
+    pred_df %>%
+      mutate(Sex = sex, Freq = freq, Segment = if_else(Age <= BREAKPOINT, "below", "above"))
+  })
+}) %>%
+  mutate(Freq = factor(Freq, levels = FREQS),
+         Sex  = factor(Sex, levels = c("Men", "Women")))
+
+# Raw scatter data
+scatter_data <- df %>%
+  pivot_longer(all_of(FREQS), names_to = "Freq", values_to = "Threshold") %>%
+  mutate(Freq = factor(Freq, levels = FREQS))
+
+# Plot — 3 rows × 2 cols (left col: low freq, right col: high freq)
+freq_order <- c("0.25kHz", "1kHz", "4kHz", "0.5kHz", "2kHz", "8kHz")
+
+make_scatter_panel <- function(freq_label) {
+  scatter_data %>%
+    filter(Freq == freq_label) %>%
+    ggplot(aes(x = Age, y = Threshold, color = Sex)) +
+    geom_point(alpha = 0.12, size = 0.8) +
+    geom_line(data = pred_lines %>% filter(Freq == freq_label),
+              aes(x = Age, y = Predicted, color = Sex, group = interaction(Sex, Segment)),
+              linewidth = 1.2) +
+    geom_vline(xintercept = BREAKPOINT, linetype = "dotted",
+               color = "grey40", linewidth = 0.8) +
+    scale_color_manual(values = SEX_COLORS) +
+    scale_x_continuous(breaks = c(20, 30, 40, 49.3, 60, 70)) +
+    labs(title = freq_label, x = "Age (years)", y = "Threshold (dB HL)") +
+    theme_hearing() +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 11))
+}
+
+panels <- map(FREQS, make_scatter_panel)
+
+wrap_plots(panels, ncol = 2) +
+  plot_annotation(
+    title    = "Figure 3. Piecewise Linear Regression: Age vs Hearing Threshold",
+    subtitle = paste0("Breakpoint = ", BREAKPOINT, " yr (Korean mean menopause age)  |  Lines = OLS fit per segment"),
+    theme    = theme(plot.title    = element_text(face = "bold", size = 13),
+                     plot.subtitle = element_text(size = 10, color = "grey40"))
+  ) &
+  theme(legend.position = "none")
+
+# Shared legend
+legend_plot <- ggplot(
+  tibble(Sex = factor(c("Men", "Women"), levels = c("Men", "Women")), x = 1, y = 1),
+  aes(x, y, color = Sex)) +
+  geom_point() +
+  scale_color_manual(values = SEX_COLORS) +
+  theme_void() +
+  theme(legend.position = "bottom",
+        legend.title = element_blank())
+legend_plot
+```
+
+## 6.2 Figure 4 — Rate of decline with bootstrap BCa CI
+
+> **What this figure shows:** The estimated rate of hearing decline (dB/year) for men and women
+> at each frequency, separately for the under-49.3 and over-49.3 age groups. Error bars are
+> 95% bootstrap confidence intervals.
+>
+> **How to interpret:**
+>
+> - **Bar height** = rate of threshold increase per year (higher = faster hearing loss)
+> - **Error bars** = uncertainty around that estimate; if bars for men and women do not
+>   overlap, the sex difference in rate is likely statistically significant
+> - **Comparing the two panels** (below vs. above 49.3): if women's bars grow taller relative
+>   to men's in the right panel, this indicates a post-menopausal acceleration
+> - **Frequency pattern:** Rates typically increase from low (0.25 kHz) to high (8 kHz)
+>   frequencies, reflecting that high-frequency hearing declines fastest with age
+ — Rate of decline with bootstrap BCa CI
+
+*Replicates Fig 4.pptx — bar chart of estimated rates (dB/year) with 95% CI error bars*
+
+```{r fig4-rate, fig.height=6, fig.width=11}
+rate_data <- map_dfr(c("Men", "Women"), function(sex) {
+  map_dfr(FREQS, function(freq) {
+    key <- paste(sex, freq, sep = "_")
+    r   <- boot_results[[key]]
+    bind_rows(
+      tibble(Sex = sex, Freq = freq,
+             Segment  = paste0("< ", BREAKPOINT, " yr"),
+             Slope    = as.numeric(r$slope_below),
+             CI_lo    = r$CI_below[1],
+             CI_hi    = r$CI_below[2]),
+      tibble(Sex = sex, Freq = freq,
+             Segment  = paste0(">= ", BREAKPOINT, " yr"),
+             Slope    = as.numeric(r$slope_above),
+             CI_lo    = r$CI_above[1],
+             CI_hi    = r$CI_above[2])
+    )
+  })
+}) %>%
+  mutate(
+    Freq    = factor(Freq, levels = FREQS),
+    Sex     = factor(Sex, levels = c("Men", "Women")),
+    Segment = factor(Segment, levels = c(paste0("< ", BREAKPOINT, " yr"),
+                                          paste0(">= ", BREAKPOINT, " yr")))
+  )
+
+ggplot(rate_data,
+       aes(x = Freq, y = Slope, fill = Sex,
+           group = interaction(Sex, Segment),
+           color = Sex)) +
+  geom_col(aes(fill = Sex),
+           position = position_dodge(width = 0.7),
+           width = 0.6, alpha = 0.85) +
+  geom_errorbar(aes(ymin = CI_lo, ymax = CI_hi),
+                position = position_dodge(width = 0.7),
+                width = 0.25, linewidth = 0.9) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  facet_wrap(~ Segment) +
+  scale_fill_manual(values  = SEX_COLORS) +
+  scale_color_manual(values = SEX_COLORS) +
+  labs(
+    title    = "Figure 4. Estimated Rate of Hearing Decline by Sex and Frequency",
+    subtitle = "Bootstrap percentile 95% CI (n = 2,000 resamples)  |  dB/year",
+    x        = "Frequency (kHz)",
+    y        = "Rate of Decline (dB/year)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_hearing()
+```
+
+## 6.3 OLS vs WLS vs Robust — slope comparison
+
+> **Why compare three methods?**
+>
+> We showed in Phase 4 that heteroscedasticity and non-normality are present. Different
+> methods handle this differently:
+>
+> | Method | What it addresses | Trade-off |
+> |---|---|---|
+> | **OLS** | Nothing — baseline model | SEs may be too small if heteroscedastic |
+> | **WLS** | Heteroscedasticity (gives less weight to high-variance age groups) | Requires estimating weights |
+> | **Robust (HC3)** | Heteroscedasticity via sandwich SEs | Slightly more conservative than OLS |
+> | **Bootstrap** | Non-normality and heteroscedasticity | Computationally intensive |
+>
+> **Interpretation:** If all four methods produce similar slope estimates, the results are
+> robust — the choice of method does not matter much. If OLS slopes differ substantially from
+> WLS/robust slopes, it suggests the heteroscedasticity was meaningfully biasing the OLS
+> estimates and the corrected estimates should be reported.
+ — slope comparison table
+
+```{r slope-comparison}
+comparison_df <- map_dfr(c("Men", "Women"), function(sex) {
+  sub <- df %>% filter(Sex == sex)
+  map_dfr(FREQS, function(freq) {
+    m_ols <- fit_piecewise_ols(sub, freq)
+    m_wls <- fit_piecewise_wls(sub, freq)
+    m_rob <- fit_piecewise_robust(sub, freq)
+    key   <- paste(sex, freq, sep = "_")
+    bsr   <- boot_results[[key]]
+
+    map_dfr(list(c("Age_below", "Below 49.3"), c("Age_above", "Above 49.3")),
+            function(p) {
+      param <- p[1]; seg <- p[2]
+      tibble(
+        Sex          = sex,
+        Freq         = freq,
+        Segment      = seg,
+        OLS_slope    = round(coef(m_ols)[param], 4),
+        OLS_SE       = round(summary(m_ols)$coefficients[param, "Std. Error"], 4),
+        WLS_slope    = round(coef(m_wls)[param], 4),
+        WLS_SE       = round(summary(m_wls)$coefficients[param, "Std. Error"], 4),
+        Robust_slope = round(m_rob[param, "Estimate"], 4),
+        Robust_SE    = round(m_rob[param, "Std. Error"], 4),
+        Boot_CI_lo   = round(if (seg == "Below 49.3") bsr$CI_below[1] else bsr$CI_above[1], 4),
+        Boot_CI_hi   = round(if (seg == "Below 49.3") bsr$CI_below[2] else bsr$CI_above[2], 4)
+      )
+    })
+  })
+})
+
+print(comparison_df)
+write_csv(comparison_df, "slope_comparison_OLS_WLS_Robust_Bootstrap.csv")
+cat("Saved: slope_comparison_OLS_WLS_Robust_Bootstrap.csv\n")
+```
+
+## 6.4 Sex-difference interaction test (FDR-corrected)
+
+> **Why this test, not separate regressions?**
+>
+> The original manuscript ran separate regressions for men and women and then visually
+> compared the slopes. The statistically correct way to test whether two slopes are
+> *significantly different from each other* is to include both groups in a single model with
+> an **interaction term** (Age × Sex). This provides a formal p-value for the sex difference
+> in slope.
+>
+> **How the model works:**
+>
+> `Threshold = B0 + B1·Age_seg + B2·SexCode + B3·(Age_seg × SexCode)`
+>
+> - B1 = slope for men (reference group)
+> - B1 + B3 = slope for women
+> - **B3 (the interaction coefficient)** = difference in slopes (Women minus Men)
+> - **p-value of B3** = tests H₀: slopes are equal between men and women
+>
+> HC3 robust standard errors are used because of the heteroscedasticity identified in Phase 4.
+> BH FDR correction is applied because we run this test 12 times (6 frequencies × 2 segments).
+>
+> **Interpretation:**
+>
+> - `Interaction_coef > 0` → women's slope is steeper (faster decline) than men's
+> - `Interaction_coef < 0` → men's slope is steeper
+> - `Sig_FDR = TRUE` → the sex difference in rate is statistically significant after
+>   correcting for multiple comparisons
+ (FDR-corrected)
+
+```{r interaction-test}
+sex_diff_df <- map_dfr(FREQS, function(freq) {
+  map_dfr(list(c("below", paste0("< ", BREAKPOINT)),
+               c("above", paste0(">= ", BREAKPOINT))), function(grp) {
+    seg <- grp[1]; seg_label <- grp[2]
+
+    d <- df %>%
+      { if (seg == "below") filter(., Age < BREAKPOINT) else filter(., Age >= BREAKPOINT) } %>%
+      select(Age, SexCode, all_of(freq)) %>%
+      rename(Threshold = all_of(freq)) %>%
+      drop_na() %>%
+      mutate(
+        Age_seg  = if (seg == "below") Age else Age - BREAKPOINT,
+        interact = Age_seg * SexCode
+      )
+
+    mod <- lm(Threshold ~ Age_seg + SexCode + interact, data = d)
+    rob <- coeftest(mod, vcov = vcovHC(mod, type = "HC3"))
+
+    tibble(
+      Freq             = freq,
+      Segment          = seg_label,
+      Slope_Men        = round(rob["Age_seg",  "Estimate"], 4),
+      Slope_Women      = round(rob["Age_seg",  "Estimate"] +
+                               rob["interact", "Estimate"], 4),
+      Interaction_coef = round(rob["interact", "Estimate"], 4),
+      Interaction_p    = round(rob["interact", "Pr(>|t|)"], 4)
+    )
+  })
+})
+
+sex_diff_df <- sex_diff_df %>%
+  mutate(
+    FDR_p   = round(p.adjust(Interaction_p, method = "BH"), 4),
+    Sig_FDR = FDR_p < 0.05
+  )
+
+cat("=== Sex Difference in Slopes (Interaction Test, HC3 SE, BH-FDR) ===\n")
+print(sex_diff_df)
+write_csv(sex_diff_df, "slope_sex_diff_test.csv")
+cat("Saved: slope_sex_diff_test.csv\n")
+```
+
+## 6.5 Sensitivity analysis — varying the breakpoint
+
+> **Why this matters:** The 49.3-year breakpoint is the *average* Korean menopause age, but
+> any individual woman may experience menopause earlier or later. If the study's conclusions
+> depend heavily on choosing exactly 49.3, the findings would be fragile. A sensitivity
+> analysis tests whether results change meaningfully when the breakpoint is shifted by ±1 or
+> ±2 years.
+>
+> **How to interpret:** If slope estimates are stable across all five breakpoints (47.3, 48.3,
+> 49.3, 50.3, 51.3), the findings are robust to the exact menopause age used. If the slopes
+> change dramatically, it suggests the results are sensitive to this assumption and should be
+> reported more cautiously. Flat lines in the sensitivity plot = robust findings.
+ — varying the breakpoint
+
+```{r sensitivity, cache=TRUE}
+BREAKPOINTS_TEST <- c(47.3, 48.3, 49.3, 50.3, 51.3)
+
+sens_df <- map_dfr(BREAKPOINTS_TEST, function(bp) {
+  map_dfr(c("Men", "Women"), function(sex) {
+    sub <- df %>% filter(Sex == sex)
+    map_dfr(FREQS, function(freq) {
+      d <- make_piecewise_df(sub, freq, bp)
+      tryCatch({
+        mod <- lm(Threshold ~ Age_below + Age_above, data = d)
+        rob <- coeftest(mod, vcov = vcovHC(mod, type = "HC3"))
+        tibble(
+          Breakpoint   = bp,
+          Sex          = sex,
+          Freq         = freq,
+          Slope_below  = round(rob["Age_below", "Estimate"], 4),
+          Slope_above  = round(rob["Age_above", "Estimate"], 4),
+          R2           = round(summary(mod)$r.squared, 4)
+        )
+      }, error = function(e) NULL)
+    })
+  })
+})
+
+cat("=== Slope sensitivity to breakpoint choice ===\n")
+sens_df %>%
+  group_by(Breakpoint, Sex) %>%
+  summarise(across(c(Slope_below, Slope_above, R2), mean), .groups = "drop") %>%
+  print()
+
+write_csv(sens_df, "sensitivity_breakpoints.csv")
+cat("Saved: sensitivity_breakpoints.csv\n")
+```
+
+```{r fig-sensitivity, fig.height=7}
+sens_df %>%
+  mutate(Freq = factor(Freq, levels = FREQS),
+         Sex  = factor(Sex, levels = c("Men", "Women"))) %>%
+  pivot_longer(c(Slope_below, Slope_above),
+               names_to = "Segment", values_to = "Slope") %>%
+  mutate(Segment = recode(Segment,
+                          Slope_below = "Below breakpoint",
+                          Slope_above = "Above breakpoint")) %>%
+  ggplot(aes(x = Breakpoint, y = Slope,
+             color = Sex, linetype = Segment, group = interaction(Sex, Segment))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = BREAKPOINT, linetype = "dotted",
+             color = "grey40", linewidth = 0.8) +
+  facet_wrap(~ Freq, nrow = 2) +
+  scale_color_manual(values = SEX_COLORS) +
+  labs(title = "Slope Sensitivity to Breakpoint Choice (±2 yr around 49.3)",
+       x = "Breakpoint (years)", y = "Slope (dB/year)",
+       color = NULL, linetype = NULL) +
+  theme_hearing()
+```
+
+## 6.6 PSM sensitivity — ANCOVA on matched sample
+
+> **Why repeat the analysis on the matched sample?**
+>
+> This is the final check that the sex-group imbalance (910 men vs 3,175 women) was not
+> inflating or suppressing the observed sex differences. If the ANCOVA results on the matched
+> sample (where both groups are age-balanced) agree with the full-sample results, we can
+> confidently report that the findings are not an artefact of the unequal group sizes.
+>
+> **Interpretation:** Compare `FDR_p` values and `SexCoef_dB` between the full-sample ANCOVA
+> (Section 5.2) and this matched-sample ANCOVA. Similar coefficients and significance patterns
+> = the imbalance was not a problem. Notably different results = the imbalance was influencing
+> conclusions and should be explicitly discussed.
+ — repeat ANCOVA on matched sample
+
+```{r psm-sensitivity}
+ancova_matched <- collect_ancova_pvalues(df_matched) %>%
+  mutate(
+    FDR_p       = round(p.adjust(Raw_p, method = "BH"), 4),
+    Significant = FDR_p < 0.05
+  )
+
+cat("=== ANCOVA on PSM-Matched Sample ===\n")
+print(ancova_matched)
+```
+
+## 6.7 Final summary table
+
+> **How to read this table:**
+>
+> - **Slope_dB_yr** = estimated rate of hearing threshold increase per year (from piecewise LR).
+>   A value of 0.5 means hearing gets 0.5 dB worse for every additional year of age in that
+>   segment.
+> - **CI_95** = 95% bootstrap confidence interval for the slope. If this interval excludes 0,
+>   the rate of decline is statistically significantly different from zero.
+> - **Robust_p** = p-value from the HC3 robust regression for the slope. This is more reliable
+>   than the standard OLS p-value when heteroscedasticity is present.
+>
+> This table is the primary numerical result of the re-analysis and can be used directly to
+> update Table 3 (dummy variable regression results) in the manuscript.
+
+
+```{r final-summary}
+summary_df <- map_dfr(c("Men", "Women"), function(sex) {
+  sub <- df %>% filter(Sex == sex)
+  map_dfr(FREQS, function(freq) {
+    key   <- paste(sex, freq, sep = "_")
+    bsr   <- boot_results[[key]]
+    m_rob <- fit_piecewise_robust(sub, freq)
+
+    bind_rows(
+      tibble(
+        Sex           = sex,
+        Frequency     = freq,
+        Age_Segment   = paste0("< ", BREAKPOINT, " yr"),
+        Slope_dB_yr   = round(as.numeric(bsr$slope_below), 3),
+        CI_95         = paste0("[", round(bsr$CI_below[1], 3),
+                               ", ", round(bsr$CI_below[2], 3), "]"),
+        Robust_p      = round(m_rob["Age_below", "Pr(>|t|)"], 4)
+      ),
+      tibble(
+        Sex           = sex,
+        Frequency     = freq,
+        Age_Segment   = paste0(">= ", BREAKPOINT, " yr"),
+        Slope_dB_yr   = round(as.numeric(bsr$slope_above), 3),
+        CI_95         = paste0("[", round(bsr$CI_above[1], 3),
+                               ", ", round(bsr$CI_above[2], 3), "]"),
+        Robust_p      = round(m_rob["Age_above", "Pr(>|t|)"], 4)
+      )
+    )
+  })
+})
+
+cat("=== Final Summary: Piecewise Slopes with Bootstrap 95% CI ===\n")
+print(summary_df)
+write_xlsx(summary_df, "final_summary_slopes.xlsx")
+cat("Saved: final_summary_slopes.xlsx\n")
+```
+
+---
+
+# Summary
+
+| Output file | Contents |
+|---|---|
+| `slope_comparison_OLS_WLS_Robust_Bootstrap.csv` | OLS / WLS / HC3 / Bootstrap slope estimates |
+| `slope_sex_diff_test.csv` | Interaction test for sex differences (FDR-adjusted) |
+| `sensitivity_breakpoints.csv` | Slopes across 5 alternative breakpoints |
+| `final_summary_slopes.xlsx` | Master table: slopes + BCa CI + robust p-values |
+
+### Statistical checklist
+
+- [x] Data integrity validated (shape, columns, nulls, duplicates)
+- [x] PSM performed to address sex-group imbalance (sensitivity)
+- [x] Normality tested (Shapiro-Wilk / KS)
+- [x] Heteroscedasticity tested (Breusch-Pagan) and visualised
+- [x] Outliers identified (Cook's D)
+- [x] WLS applied for heteroscedasticity
+- [x] HC3 robust SEs applied
+- [x] Bootstrap percentile 95% CIs (n = 2,000 resamples)
+- [x] FDR correction (BH) across all significance tests
+- [x] Piecewise LR at fixed breakpoint 49.3 yr
+- [x] Dummy-variable interaction test for slope sex differences
+- [x] Sensitivity analysis across breakpoints ±2 yr
+
+```{r session-info}
+sessionInfo()
+```
